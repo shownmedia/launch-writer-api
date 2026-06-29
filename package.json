@@ -12,6 +12,7 @@
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "googleapis": "^148.0.0",
+    "openai": "^6.45.0",
     "uuid": "^11.1.0"
   },
   "devDependencies": {
