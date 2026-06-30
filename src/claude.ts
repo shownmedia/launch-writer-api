@@ -1,11 +1,7 @@
-import Anthropic from "@anthropic-ai/sdk";
 import * as fs from "fs";
 import * as path from "path";
 import { AGENT_KB_FILES, AGENT_MODELS, MODEL_MAP } from "./types";
-
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY!,
-});
+import { createMessage, streamMessage } from "./ai-client";
 
 const PROMPTS_DIR = path.join(__dirname, "..", "src", "prompts");
 
@@ -103,36 +99,26 @@ export async function callAgent(
 
   if (onProgress) {
     // Streaming mode
-    let fullText = "";
-    const stream = anthropic.messages.stream({
-      model,
-      max_tokens: 8192,
-      system,
-      messages: [{ role: "user", content: userMessage }],
-    });
-
-    for await (const event of stream) {
-      if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
-        fullText += event.delta.text;
-        onProgress(event.delta.text);
-      }
-    }
+    const fullText = await streamMessage(
+      {
+        model,
+        max_tokens: 8192,
+        system,
+        messages: [{ role: "user", content: userMessage }],
+      },
+      onProgress
+    );
 
     console.log(`[Agent] Completed ${agentName} — ${fullText.length.toLocaleString()} chars output`);
     return fullText;
   } else {
     // Non-streaming mode
-    const response = await anthropic.messages.create({
+    const text = await createMessage({
       model,
       max_tokens: 8192,
       system,
       messages: [{ role: "user", content: userMessage }],
     });
-
-    const text = response.content
-      .filter((block): block is Anthropic.TextBlock => block.type === "text")
-      .map((block) => block.text)
-      .join("\n");
 
     console.log(`[Agent] Completed ${agentName} — ${text.length.toLocaleString()} chars output`);
     return text;
@@ -276,24 +262,23 @@ ${beforeAfters}
 - You're excited about strong brands. You push back on weak material.
 - You never hedge. You never say "I think maybe." You say "Here's the angle." "This is the enemy." "The hook writes itself."`;
 
-  const stream = anthropic.messages.stream({
-    model: MODEL_MAP.opus,
-    max_tokens: 4096,
-    system: systemPrompt,
-    messages,
-  });
-
   const encoder = new TextEncoder();
 
   return new ReadableStream({
     async start(controller) {
       try {
-        for await (const event of stream) {
-          if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
-            const chunk = `data: ${JSON.stringify({ text: event.delta.text })}\n\n`;
+        await streamMessage(
+          {
+            model: MODEL_MAP.opus,
+            max_tokens: 4096,
+            system: systemPrompt,
+            messages,
+          },
+          (text) => {
+            const chunk = `data: ${JSON.stringify({ text })}\n\n`;
             controller.enqueue(encoder.encode(chunk));
           }
-        }
+        );
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
       } catch (err) {

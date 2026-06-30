@@ -55,8 +55,20 @@ export interface SSEEvent {
 }
 
 export const MODEL_MAP: Record<AgentModel, string> = {
-  opus: "claude-opus-4-20250514",
-  sonnet: "claude-sonnet-4-20250514",
+  // Use rolling, non-dated aliases — pinned `-YYYYMMDD` snapshots get retired by
+  // Anthropic and then 404 at request time.
+  opus: "claude-opus-4-8",
+  sonnet: "claude-sonnet-4-6",
+};
+
+/**
+ * OpenAI fallback models, keyed by the Anthropic model id they stand in for.
+ * Used by src/ai-client.ts when Anthropic fails or AI_PROVIDER=openai. Default
+ * gpt-4o, overridable via env so the model can change without a code edit.
+ */
+export const OPENAI_MODEL_MAP: Record<string, string> = {
+  [MODEL_MAP.opus]: process.env.OPENAI_OPUS_MODEL || "gpt-4o",
+  [MODEL_MAP.sonnet]: process.env.OPENAI_SONNET_MODEL || "gpt-4o",
 };
 
 // Agent → model routing (from SKILL.md)
