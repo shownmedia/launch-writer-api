@@ -25,11 +25,14 @@ async function startRedditRun(query: string, maxResults: number = 166): Promise<
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      // This actor's input schema uses searchTerms/searchPosts/searchSort/
+      // maxPostsCount. The old {searches, maxItems, sort} keys are ignored, so
+      // the run fails with "provide at least one startUrl, searchTerm, or subreddit".
       body: JSON.stringify({
-        searches: [query],
-        maxItems: maxResults,
-        sort: "relevance",
-        proxy: { useApifyProxy: true },
+        searchTerms: [query],
+        searchPosts: true,
+        searchSort: "relevance",
+        maxPostsCount: maxResults,
       }),
     }
   );
@@ -68,9 +71,9 @@ async function fetchResults(datasetId: string): Promise<RedditResult[]> {
   return data.map((item: Record<string, unknown>) => ({
     title: (item.title || "") as string,
     text: (item.body || item.selftext || "") as string,
-    subreddit: (item.subreddit || item.communityName || "") as string,
+    subreddit: (item.communityName || item.subreddit || "") as string,
     upvotes: (item.upVotes || item.ups || 0) as number,
-    url: (item.url || "") as string,
+    url: (item.postUrl || item.contentUrl || item.url || "") as string,
     comments: Array.isArray(item.comments)
       ? (item.comments as Array<Record<string, unknown>>).map((c) => ({
           text: (c.body || c.text || "") as string,

@@ -27,11 +27,14 @@ async function startActorRun(query: string, maxTweets: number = 1000): Promise<s
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      // This actor keys off `mode`. Without it the run defaults to
+      // "Get Tweet by ID" and fails with "Missing 'id' parameter". Advanced
+      // Search accepts full Twitter search operators (min_faves:, since:, filters).
       body: JSON.stringify({
-        searchTerms: [query],
-        maxTweets,
-        sort: "Top",
-        tweetLanguage: "en",
+        mode: "Advanced Search",
+        query,
+        count: maxTweets,
+        max_results: maxTweets,
       }),
     }
   );
@@ -67,18 +70,20 @@ async function fetchResults(datasetId: string): Promise<TweetResult[]> {
   if (!res.ok) throw new Error(`Apify results failed: ${res.status}`);
   const data = (await res.json()) as Array<Record<string, unknown>>;
 
+  // This actor returns FLAT fields (username, user_followers_count, …), not the
+  // nested `user`/`public_metrics` objects of the Twitter API. Map accordingly.
   return data.map(
     (t: Record<string, unknown>) => ({
       text: (t.full_text || t.text || "") as string,
-      likes: ((t.favorite_count as number) || (t.public_metrics as Record<string, number>)?.like_count || 0),
-      retweets: ((t.retweet_count as number) || (t.public_metrics as Record<string, number>)?.retweet_count || 0),
-      replies: ((t.reply_count as number) || (t.public_metrics as Record<string, number>)?.reply_count || 0),
-      quotes: ((t.quote_count as number) || (t.public_metrics as Record<string, number>)?.quote_count || 0),
-      author: ((t.user as Record<string, string>)?.screen_name || (t.author as Record<string, string>)?.username || "unknown"),
-      followers: ((t.user as Record<string, number>)?.followers_count || 0),
-      verified: !!((t.user as Record<string, boolean>)?.verified || (t.author as Record<string, boolean>)?.verified),
+      likes: (t.favorite_count as number) || 0,
+      retweets: (t.retweet_count as number) || 0,
+      replies: (t.reply_count as number) || 0,
+      quotes: (t.quote_count as number) || 0,
+      author: (t.username || t.user_name || "unknown") as string,
+      followers: (t.user_followers_count as number) || 0,
+      verified: !!(t.user_verified || t.user_is_blue_verified),
       date: (t.created_at || "") as string,
-      hasMedia: !!((t.entities as Record<string, unknown>)?.media || (t.attachments as Record<string, unknown>)?.media_keys),
+      hasMedia: Array.isArray(t.media) && (t.media as unknown[]).length > 0,
     })
   ).sort((a: TweetResult, b: TweetResult) => (b.likes + b.retweets) - (a.likes + a.retweets));
 }
