@@ -19,7 +19,9 @@ interface RedditResult {
 
 async function startRedditRun(query: string, maxResults: number = 166): Promise<string> {
   const res = await fetch(
-    `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN_REDDIT}`,
+    // Apify API paths use the `username~actorname` form; a literal `/` in the slug
+    // breaks the path and 404s the run-start call.
+    `https://api.apify.com/v2/acts/${ACTOR_ID.replace("/", "~")}/runs?token=${APIFY_TOKEN_REDDIT}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },

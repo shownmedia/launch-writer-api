@@ -21,7 +21,9 @@ interface TweetResult {
 
 async function startActorRun(query: string, maxTweets: number = 1000): Promise<string> {
   const res = await fetch(
-    `https://api.apify.com/v2/acts/${ACTOR_ID}/runs?token=${APIFY_TOKEN}`,
+    // Apify API paths use the `username~actorname` form; a literal `/` in the slug
+    // breaks the path and 404s the run-start call.
+    `https://api.apify.com/v2/acts/${ACTOR_ID.replace("/", "~")}/runs?token=${APIFY_TOKEN}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
