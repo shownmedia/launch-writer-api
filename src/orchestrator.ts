@@ -140,6 +140,33 @@ export async function runPipeline(
     });
   };
 
+  // Names of steps that degraded (see safeAgent) — surfaced at the top of the
+  // final script so the user knows exactly what to review or rerun.
+  const warnings: string[] = [];
+
+  // Run a single-agent step with graceful degradation. On failure the step is
+  // marked "failed" (NOT thrown), a warning is recorded, and `fallback` is
+  // returned — so one bad or slow agent can't abort the whole 8+ minute run.
+  const safeAgent = async (
+    name: string,
+    agent: string,
+    inputs: Record<string, string>,
+    fallback: string
+  ): Promise<string> => {
+    updateStep(name, "running");
+    try {
+      const result = await callAgent(agent, inputs);
+      updateStep(name, "completed");
+      return result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[Pipeline] ${name} failed — degrading:`, msg);
+      warnings.push(name);
+      updateStep(name, "failed", msg);
+      return fallback;
+    }
+  };
+
   // Define all steps
   addStep("Brand Brief", "setup", "sonnet");
   addStep("Keywords", "research-agent", "sonnet");
@@ -285,16 +312,27 @@ export async function runPipeline(
     await Promise.all(researchPromises);
 
     // ── STEP 4: Research Compiler ──
-    updateStep("Research Compiler", "running");
-    const researchBrief = await callAgent("research-compiler", {
-      brief,
-      youtube_research: session.outputs["youtube_research"] || "",
-      x_research: session.outputs["x_research"] || "",
-      reddit_pain: session.outputs["reddit_pain"] || "",
-      industry_data: session.outputs["industry_data"] || "",
-    });
+    const researchFallback = [
+      session.outputs["youtube_research"],
+      session.outputs["x_research"],
+      session.outputs["reddit_pain"],
+      session.outputs["industry_data"],
+    ]
+      .filter(Boolean)
+      .join("\n\n---\n\n");
+    const researchBrief = await safeAgent(
+      "Research Compiler",
+      "research-compiler",
+      {
+        brief,
+        youtube_research: session.outputs["youtube_research"] || "",
+        x_research: session.outputs["x_research"] || "",
+        reddit_pain: session.outputs["reddit_pain"] || "",
+        industry_data: session.outputs["industry_data"] || "",
+      },
+      researchFallback
+    );
     session.outputs["research_brief"] = researchBrief;
-    updateStep("Research Compiler", "completed");
 
     // Write research to Google Doc
     if (session.googleDocId) {
@@ -311,50 +349,50 @@ export async function runPipeline(
     const [hooksDraft, giveawayDraft] = await Promise.all([
       // Track A: Hook Writer
       (async () => {
-        updateStep("Hook Writer", "running");
-        const result = await callAgent("hook-writer", {
-          brief,
-          research_brief: researchBrief,
-        });
+        const result = await safeAgent(
+          "Hook Writer",
+          "hook-writer",
+          { brief, research_brief: researchBrief },
+          "[Hook generation failed — please rerun the hooks.]"
+        );
         session.outputs["hooks_draft"] = result;
-        updateStep("Hook Writer", "completed");
         return result;
       })(),
 
       // Track B: Giveaway Writer
       (async () => {
-        updateStep("Giveaway Writer", "running");
-        const result = await callAgent("giveaway-writer", {
-          brief,
-          research_brief: researchBrief,
-        });
+        const result = await safeAgent(
+          "Giveaway Writer",
+          "giveaway-writer",
+          { brief, research_brief: researchBrief },
+          "[Giveaway generation failed — please rerun the giveaway.]"
+        );
         session.outputs["giveaway_draft"] = result;
-        updateStep("Giveaway Writer", "completed");
         return result;
       })(),
     ]);
 
-    // Managers (parallel)
+    // Managers (parallel) — on failure fall back to the unreviewed draft.
     const [hooksApproved, giveawayApproved] = await Promise.all([
       (async () => {
-        updateStep("Hook Manager", "running");
-        const result = await callAgent("hook-manager", {
-          hooks_draft: hooksDraft,
-          brief,
-        });
+        const result = await safeAgent(
+          "Hook Manager",
+          "hook-manager",
+          { hooks_draft: hooksDraft, brief },
+          hooksDraft
+        );
         session.outputs["hooks_approved"] = result;
-        updateStep("Hook Manager", "completed");
         return result;
       })(),
 
       (async () => {
-        updateStep("Giveaway Manager", "running");
-        const result = await callAgent("giveaway-manager", {
-          giveaway_draft: giveawayDraft,
-          brief,
-        });
+        const result = await safeAgent(
+          "Giveaway Manager",
+          "giveaway-manager",
+          { giveaway_draft: giveawayDraft, brief },
+          giveawayDraft
+        );
         session.outputs["giveaway_approved"] = result;
-        updateStep("Giveaway Manager", "completed");
         return result;
       })(),
     ]);
@@ -362,98 +400,108 @@ export async function runPipeline(
     // ── PHASE 4: Body (sequential chain) ──
     emit("progress", undefined, undefined, "Writing body...");
 
-    updateStep("Body Writer", "running");
-    const bodyDraft = await callAgent("body-writer", {
-      brief,
-      research_brief: researchBrief,
-      hooks_approved: hooksApproved,
-    });
+    const bodyDraft = await safeAgent(
+      "Body Writer",
+      "body-writer",
+      { brief, research_brief: researchBrief, hooks_approved: hooksApproved },
+      "[Body generation failed — please rerun the body.]"
+    );
     session.outputs["body_draft"] = bodyDraft;
-    updateStep("Body Writer", "completed");
 
-    // Specialists chain (sequential — each builds on the last)
-    updateStep("Weapons Specialist", "running");
-    const weaponsDone = await callAgent("weapons-specialist", {
-      body_draft: bodyDraft,
-      brief,
-    });
+    // Specialists chain (sequential — each builds on the last). On failure a
+    // specialist passes the previous stage through unchanged, so the chain
+    // continues instead of aborting.
+    const weaponsDone = await safeAgent(
+      "Weapons Specialist",
+      "weapons-specialist",
+      { body_draft: bodyDraft, brief },
+      bodyDraft
+    );
     session.outputs["weapons_done"] = weaponsDone;
-    updateStep("Weapons Specialist", "completed");
 
-    updateStep("Controversy Specialist", "running");
-    const controversyDone = await callAgent("controversy-specialist", {
-      weapons_done: weaponsDone,
-      brief,
-    });
+    const controversyDone = await safeAgent(
+      "Controversy Specialist",
+      "controversy-specialist",
+      { weapons_done: weaponsDone, brief },
+      weaponsDone
+    );
     session.outputs["controversy_done"] = controversyDone;
-    updateStep("Controversy Specialist", "completed");
 
-    updateStep("Technical Specialist", "running");
-    const technicalDone = await callAgent("technical-specialist", {
-      controversy_done: controversyDone,
-      brief,
-      fathom_transcript: brandInfo.fathomTranscript || "",
-    });
+    const technicalDone = await safeAgent(
+      "Technical Specialist",
+      "technical-specialist",
+      {
+        controversy_done: controversyDone,
+        brief,
+        fathom_transcript: brandInfo.fathomTranscript || "",
+      },
+      controversyDone
+    );
     session.outputs["technical_done"] = technicalDone;
-    updateStep("Technical Specialist", "completed");
 
-    updateStep("Flow Specialist", "running");
-    const flowDone = await callAgent("flow-specialist", {
-      technical_done: technicalDone,
-      hooks_approved: hooksApproved,
-      brief,
-    });
+    const flowDone = await safeAgent(
+      "Flow Specialist",
+      "flow-specialist",
+      { technical_done: technicalDone, hooks_approved: hooksApproved, brief },
+      technicalDone
+    );
     session.outputs["flow_done"] = flowDone;
-    updateStep("Flow Specialist", "completed");
 
-    // Body Manager (FINAL GATE)
-    updateStep("Body Manager", "running");
-    const bodyFinal = await callAgent("body-manager", {
-      flow_done: flowDone,
-      brief,
-    });
+    // Body Manager (FINAL GATE) — on failure fall back to the unreviewed body.
+    const bodyFinal = await safeAgent(
+      "Body Manager",
+      "body-manager",
+      { flow_done: flowDone, brief },
+      flowDone
+    );
     session.outputs["body_final"] = bodyFinal;
-    updateStep("Body Manager", "completed");
 
     // ── PHASE 5: Quality + Deliver ──
     emit("progress", undefined, undefined, "Running quality checks...");
 
-    // Mom Test + Call Supervisor (parallel)
+    // Mom Test + Call Supervisor (parallel) — advisory only; skip on failure.
     const [momTestResult, callSupervisorResult] = await Promise.all([
       (async () => {
-        updateStep("Mom Test", "running");
-        const result = await callAgent("mom-test", {
-          full_script: `${hooksApproved}\n\n${bodyFinal}\n\n${giveawayApproved}`,
-        });
+        const result = await safeAgent(
+          "Mom Test",
+          "mom-test",
+          { full_script: `${hooksApproved}\n\n${bodyFinal}\n\n${giveawayApproved}` },
+          ""
+        );
         session.outputs["mom_test"] = result;
-        updateStep("Mom Test", "completed");
         return result;
       })(),
 
       (async () => {
-        updateStep("Call Supervisor", "running");
-        const result = await callAgent("call-supervisor", {
-          brief,
-          full_script: `${hooksApproved}\n\n${bodyFinal}\n\n${giveawayApproved}`,
-        });
+        const result = await safeAgent(
+          "Call Supervisor",
+          "call-supervisor",
+          {
+            brief,
+            full_script: `${hooksApproved}\n\n${bodyFinal}\n\n${giveawayApproved}`,
+          },
+          ""
+        );
         session.outputs["call_supervisor"] = result;
-        updateStep("Call Supervisor", "completed");
         return result;
       })(),
     ]);
 
-    // Final Review
-    updateStep("Final Review", "running");
-    const finalScript = await callAgent("final-review", {
-      hooks_approved: hooksApproved,
-      body_final: bodyFinal,
-      giveaway_approved: giveawayApproved,
-      brief,
-      mom_test_feedback: momTestResult,
-      call_supervisor_feedback: callSupervisorResult,
-    });
+    // Final Review — on failure fall back to the assembled sections directly.
+    const finalScript = await safeAgent(
+      "Final Review",
+      "final-review",
+      {
+        hooks_approved: hooksApproved,
+        body_final: bodyFinal,
+        giveaway_approved: giveawayApproved,
+        brief,
+        mom_test_feedback: momTestResult,
+        call_supervisor_feedback: callSupervisorResult,
+      },
+      `${hooksApproved}\n\n${bodyFinal}\n\n${giveawayApproved}`
+    );
     session.outputs["final_script"] = finalScript;
-    updateStep("Final Review", "completed");
 
     // Deliver to Google Doc
     updateStep("Deliver", "running");
@@ -471,6 +519,14 @@ export async function runPipeline(
       }
     }
     updateStep("Deliver", "completed");
+
+    // If any step degraded, flag it at the top of the script so the user knows
+    // exactly what to review or rerun (the run still delivers a usable draft).
+    if (warnings.length) {
+      const banner = `⚠️ These sections had errors and may need a rerun: ${warnings.join(", ")}\n\n---\n\n`;
+      session.outputs["final_script"] = banner + (session.outputs["final_script"] || "");
+      session.outputs["_warnings"] = warnings.join(", ");
+    }
 
     session.status = "completed";
     emit("done", undefined, undefined, "Pipeline complete!");
