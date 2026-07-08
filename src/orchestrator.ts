@@ -11,15 +11,21 @@ import { runXResearch } from "./tools/apify-x";
 import { runRedditResearch } from "./tools/apify-reddit";
 import { createDoc, appendToDoc, writeFinalScript } from "./tools/google-docs";
 import { LaunchSession, BrandInfo, StepStatus } from "./types";
+import { saveSession, loadSession, loadAllSessions } from "./db";
 
-// In-memory session store (swap for DB later)
+// In-memory cache of the currently-running session(s); the durable source of
+// truth is Postgres (see db.ts) so runs survive Railway restarts.
 const sessions = new Map<string, LaunchSession>();
 
-export function getSession(id: string): LaunchSession | undefined {
+export async function getSession(id: string): Promise<LaunchSession | undefined> {
+  const fromDb = await loadSession(id);
+  if (fromDb) return fromDb;
   return sessions.get(id);
 }
 
-export function getAllSessions(): LaunchSession[] {
+export async function getAllSessions(): Promise<LaunchSession[]> {
+  const fromDb = await loadAllSessions();
+  if (fromDb.length) return fromDb;
   return Array.from(sessions.values());
 }
 
@@ -77,10 +83,14 @@ function buildBrief(info: BrandInfo): string {
 export async function runPipeline(
   brandInfo: BrandInfo,
   driveFolderId?: string,
-  onProgress?: ProgressCallback
+  onProgress?: ProgressCallback,
+  sessionId?: string
 ): Promise<LaunchSession> {
   const session: LaunchSession = {
-    id: uuid(),
+    // Use the caller-supplied id (the one returned to the client) so the
+    // frontend can poll /api/pipeline/session/:id with the same id. Falls back
+    // to a uuid if none is provided.
+    id: sessionId || uuid(),
     brandName: brandInfo.brandName,
     status: "running",
     createdAt: new Date(),
@@ -93,6 +103,15 @@ export async function runPipeline(
   };
 
   sessions.set(session.id, session);
+
+  // Fire-and-forget persistence: a DB hiccup must never break a run. Full-state
+  // upserts are last-write-wins, and the terminal state is awaited below.
+  const persist = () => {
+    void saveSession(session).catch((e) =>
+      console.error("[db] persist failed:", e instanceof Error ? e.message : e)
+    );
+  };
+  persist();
 
   const emit = (type: string, step?: string, status?: StepStatus, message?: string) => {
     session.updatedAt = new Date();
@@ -107,6 +126,7 @@ export async function runPipeline(
       if (status === "completed" || status === "failed") step.completedAt = new Date();
       if (error) step.error = error;
     }
+    persist();
     emit("step_update", name, status, error);
   };
 
@@ -459,6 +479,13 @@ export async function runPipeline(
     const errMsg = err instanceof Error ? err.message : String(err);
     emit("error", undefined, undefined, errMsg);
     console.error("[Pipeline] Fatal error:", err);
+  }
+
+  // Durably persist the terminal state (awaited so it isn't lost to a race).
+  try {
+    await saveSession(session);
+  } catch (e) {
+    console.error("[db] final persist failed:", e instanceof Error ? e.message : e);
   }
 
   return session;

@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import { runPipeline, getSession, getAllSessions } from "./orchestrator";
 import { chatWithUser } from "./claude";
+import { initDb } from "./db";
 import type { BrandInfo } from "./types";
 import type { Response } from "express";
 
@@ -55,70 +56,6 @@ app.post("/api/chat", async (req, res) => {
 // Active SSE connections per session
 const sseClients = new Map<string, Set<Response>>();
 
-app.post("/api/pipeline/start", async (req, res) => {
-  const { brandInfo, driveFolderId } = req.body as {
-    brandInfo: BrandInfo;
-    driveFolderId?: string;
-  };
-
-  if (!brandInfo?.brandName) {
-    res.status(400).json({ error: "brandInfo with brandName required" });
-    return;
-  }
-
-  // Start pipeline in background (don't await)
-  const sessionPromise = runPipeline(brandInfo, driveFolderId, (event) => {
-    // Broadcast to all SSE clients for this session
-    const clients = sseClients.get(sessionId);
-    if (clients) {
-      const data = `data: ${JSON.stringify(event)}\n\n`;
-      for (const client of clients) {
-        try {
-          client.write(data);
-        } catch {
-          clients.delete(client);
-        }
-      }
-
-      // Close SSE connections when done
-      if (event.type === "done" || event.type === "error") {
-        for (const client of clients) {
-          try {
-            client.write(`data: ${JSON.stringify(event)}\n\n`);
-            client.end();
-          } catch {
-            // ignore
-          }
-        }
-        sseClients.delete(sessionId);
-      }
-    }
-  });
-
-  // Get session ID from the promise (it creates the session synchronously at the start)
-  // We need to handle this differently - return immediately with session ID
-  const sessionId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-
-  // Wrap to capture session
-  (async () => {
-    const session = await sessionPromise;
-    // Session is stored internally by orchestrator
-    console.log(`[Pipeline] Session ${session.id} finished: ${session.status}`);
-  })();
-
-  // The session is created immediately by runPipeline, but we need its ID
-  // Let's refactor slightly - return a preliminary response
-  res.json({
-    message: "Pipeline started",
-    sessionId,
-    streamUrl: `/api/pipeline/stream/${sessionId}`,
-  });
-
-  // Actually, let's fix the architecture - the pipeline creates the session ID internally
-  // We need to restructure this. For now, let's use the pipeline's own session tracking.
-});
-
-// Better approach: start pipeline and return session info
 app.post("/api/pipeline/launch", async (req, res) => {
   const { brandInfo, driveFolderId } = req.body as {
     brandInfo: BrandInfo;
@@ -164,7 +101,7 @@ app.post("/api/pipeline/launch", async (req, res) => {
         setTimeout(() => sseClients.delete(sessionId), 60000);
       }
     }
-  }).catch((err) => {
+  }, sessionId).catch((err) => {
     console.error("[Pipeline] Fatal error:", err);
   });
 });
@@ -197,11 +134,11 @@ app.get("/api/pipeline/stream/:sessionId", (req, res) => {
 });
 
 // Get session status/outputs
-app.get("/api/pipeline/session/:sessionId", (req, res) => {
-  const session = getSession(req.params.sessionId);
+app.get("/api/pipeline/session/:sessionId", async (req, res) => {
+  const session = await getSession(req.params.sessionId);
   if (!session) {
     // Try to find by partial match
-    const all = getAllSessions();
+    const all = await getAllSessions();
     const match = all.find((s) => s.id.includes(req.params.sessionId));
     if (match) {
       res.json(match);
@@ -214,8 +151,8 @@ app.get("/api/pipeline/session/:sessionId", (req, res) => {
 });
 
 // List all sessions
-app.get("/api/pipeline/sessions", (_req, res) => {
-  const all = getAllSessions().map((s) => ({
+app.get("/api/pipeline/sessions", async (_req, res) => {
+  const all = (await getAllSessions()).map((s) => ({
     id: s.id,
     brandName: s.brandName,
     status: s.status,
@@ -230,8 +167,8 @@ app.get("/api/pipeline/sessions", (_req, res) => {
 });
 
 // Get specific output from a session
-app.get("/api/pipeline/session/:sessionId/output/:outputKey", (req, res) => {
-  const session = getSession(req.params.sessionId);
+app.get("/api/pipeline/session/:sessionId/output/:outputKey", async (req, res) => {
+  const session = await getSession(req.params.sessionId);
   if (!session) {
     res.status(404).json({ error: "Session not found" });
     return;
@@ -244,15 +181,23 @@ app.get("/api/pipeline/session/:sessionId/output/:outputKey", (req, res) => {
   res.json({ key: req.params.outputKey, content: output });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🚀 Launch Writer API running on port ${PORT}`);
   console.log(`   Health: http://localhost:${PORT}/health`);
   console.log(`   Chat:   POST http://localhost:${PORT}/api/chat`);
   console.log(`   Launch: POST http://localhost:${PORT}/api/pipeline/launch`);
   console.log(`\n   Environment:`);
   console.log(`   - ANTHROPIC_API_KEY: ${process.env.ANTHROPIC_API_KEY ? "✓" : "✗"}`);
+  console.log(`   - OPENAI_API_KEY:    ${process.env.OPENAI_API_KEY ? "✓" : "✗"}`);
   console.log(`   - YOUTUBE_API_KEY:   ${process.env.YOUTUBE_API_KEY ? "✓" : "✗"}`);
   console.log(`   - APIFY_TOKEN:       ${process.env.APIFY_TOKEN ? "✓" : "✗"}`);
   console.log(`   - APIFY_TOKEN_REDDIT: ${process.env.APIFY_TOKEN_REDDIT ? "✓" : "✗"}`);
   console.log(`   - GOOGLE_SERVICE_ACCOUNT_JSON: ${process.env.GOOGLE_SERVICE_ACCOUNT_JSON ? "✓" : "✗"}`);
+  console.log(`   - DATABASE_URL:      ${process.env.DATABASE_URL ? "✓" : "✗ (in-memory only)"}`);
+
+  try {
+    await initDb();
+  } catch (err) {
+    console.error("[db] init failed — falling back to in-memory sessions:", err);
+  }
 });
