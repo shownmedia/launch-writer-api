@@ -51,6 +51,45 @@ export async function initDb(): Promise<void> {
     `CREATE INDEX IF NOT EXISTS pipeline_sessions_created_idx ON pipeline_sessions (created_at DESC)`
   );
   console.log("[db] pipeline_sessions ready");
+
+  const swept = await failStaleRunningSessions();
+  if (swept) console.log(`[db] swept ${swept} stale running session(s) → failed`);
+}
+
+/**
+ * On boot, any session still marked "running" is orphaned: this is a
+ * single-instance service, so a fresh start means the process that was driving
+ * that run is dead and nothing will re-drive it. Flip those to "failed" (and
+ * mark their still-running steps failed) so the UI shows "Failed" instead of
+ * spinning forever. Safe to call at startup only — before any new run begins.
+ * Returns the number of sessions swept.
+ */
+export async function failStaleRunningSessions(): Promise<number> {
+  const p = getPool();
+  if (!p) return 0;
+  const { rows } = await p.query(
+    "SELECT data FROM pipeline_sessions WHERE status = 'running'"
+  );
+  let swept = 0;
+  for (const row of rows) {
+    const session = row.data as LaunchSession;
+    session.status = "failed";
+    session.updatedAt = new Date();
+    for (const step of session.steps ?? []) {
+      if (step.status === "running") {
+        step.status = "failed";
+        step.error = step.error ?? "Interrupted by a backend restart — please rerun.";
+      }
+    }
+    const note = "Interrupted by a backend restart before finishing — please rerun.";
+    session.outputs = session.outputs ?? {};
+    session.outputs["_warnings"] = session.outputs["_warnings"]
+      ? `${session.outputs["_warnings"]}, ${note}`
+      : note;
+    await saveSession(session);
+    swept++;
+  }
+  return swept;
 }
 
 export async function saveSession(session: LaunchSession): Promise<void> {

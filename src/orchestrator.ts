@@ -503,6 +503,16 @@ export async function runPipeline(
     );
     session.outputs["final_script"] = finalScript;
 
+    // Persist the script immediately (awaited) BEFORE the fallible Deliver step.
+    // Final Review's own step-persist ran before this assignment, so without
+    // this a crash/restart during the Google-Docs write below would lose the
+    // finished script even though it exists in memory.
+    try {
+      await saveSession(session);
+    } catch (e) {
+      console.error("[db] final_script persist failed:", e instanceof Error ? e.message : e);
+    }
+
     // Deliver to Google Doc
     updateStep("Deliver", "running");
     if (session.googleDocId) {
