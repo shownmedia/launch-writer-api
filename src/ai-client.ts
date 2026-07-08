@@ -29,6 +29,27 @@ export interface AiParams {
 
 const OPENAI_DEFAULT_MODEL = process.env.OPENAI_DEFAULT_MODEL || "gpt-4o";
 
+// Reasoning models (gpt-5.x, o-series) count hidden reasoning tokens against
+// max_completion_tokens. With a small cap the reasoning phase can consume the
+// entire budget, leaving zero tokens for visible output — the root cause of
+// blank hooks/managers in the pipeline. We cap reasoning effort AND give the
+// completion budget generous headroom so output always has room. Both are
+// env-tunable without a code change.
+const OPENAI_REASONING_EFFORT = process.env.OPENAI_REASONING_EFFORT || "low";
+const OPENAI_MIN_COMPLETION_TOKENS =
+  Number(process.env.OPENAI_MAX_COMPLETION_TOKENS) || 16000;
+const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS) || 180000;
+
+function openaiCompletionTokens(requested: number): number {
+  return Math.max(requested, OPENAI_MIN_COMPLETION_TOKENS);
+}
+
+// Only reasoning-model families accept `reasoning_effort`; sending it to a
+// non-reasoning model (e.g. gpt-4o) is a 400. Gate on the model id.
+function supportsReasoning(model: string): boolean {
+  return /^(gpt-5|o1|o3|o4)/i.test(model);
+}
+
 function providerOverride(): string | undefined {
   return process.env.AI_PROVIDER?.trim().toLowerCase();
 }
@@ -60,7 +81,10 @@ function anthropic(): Anthropic {
 let openaiClient: OpenAI | null = null;
 function openai(): OpenAI {
   if (!openaiClient) {
-    openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+    openaiClient = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY!,
+      timeout: OPENAI_TIMEOUT_MS,
+    });
   }
   return openaiClient;
 }
@@ -80,16 +104,32 @@ async function anthropicCreate(params: AiParams): Promise<string> {
     .join("\n");
 }
 
-async function openaiCreate(params: AiParams): Promise<string> {
-  const completion = await openai().chat.completions.create({
-    model: openaiModelFor(params.model),
-    max_completion_tokens: params.max_tokens,
+async function openaiCreateOnce(params: AiParams, effort: string): Promise<string> {
+  const model = openaiModelFor(params.model);
+  const body: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
+    model,
+    max_completion_tokens: openaiCompletionTokens(params.max_tokens),
     messages: [
       { role: "system", content: params.system },
       ...params.messages,
     ],
-  });
+  };
+  if (supportsReasoning(model)) {
+    body.reasoning_effort = effort as typeof body.reasoning_effort;
+  }
+  const completion = await openai().chat.completions.create(body);
   return completion.choices[0]?.message?.content ?? "";
+}
+
+async function openaiCreate(params: AiParams): Promise<string> {
+  const text = await openaiCreateOnce(params, OPENAI_REASONING_EFFORT);
+  if (text.trim()) return text;
+  // Empty output: on reasoning models the reasoning phase can consume the whole
+  // completion budget. Retry once with minimal reasoning so output has room.
+  console.error(
+    `[ai-client] OpenAI returned empty output (${openaiModelFor(params.model)}); retrying with minimal reasoning`
+  );
+  return openaiCreateOnce(params, "minimal");
 }
 
 /**
@@ -142,20 +182,26 @@ async function anthropicStream(
   return full;
 }
 
-async function openaiStream(
+async function openaiStreamOnce(
   params: AiParams,
+  effort: string,
   onDelta: (text: string) => void
 ): Promise<string> {
   let full = "";
-  const stream = await openai().chat.completions.create({
-    model: openaiModelFor(params.model),
-    max_completion_tokens: params.max_tokens,
+  const model = openaiModelFor(params.model);
+  const body: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
+    model,
+    max_completion_tokens: openaiCompletionTokens(params.max_tokens),
     stream: true,
     messages: [
       { role: "system", content: params.system },
       ...params.messages,
     ],
-  });
+  };
+  if (supportsReasoning(model)) {
+    body.reasoning_effort = effort as typeof body.reasoning_effort;
+  }
+  const stream = await openai().chat.completions.create(body);
   for await (const chunk of stream) {
     const delta = chunk.choices[0]?.delta?.content;
     if (delta) {
@@ -164,6 +210,20 @@ async function openaiStream(
     }
   }
   return full;
+}
+
+async function openaiStream(
+  params: AiParams,
+  onDelta: (text: string) => void
+): Promise<string> {
+  const full = await openaiStreamOnce(params, OPENAI_REASONING_EFFORT, onDelta);
+  if (full.trim()) return full;
+  // Nothing streamed — reasoning likely consumed the budget. Retry once with
+  // minimal reasoning. Safe: no text reached the caller, so no duplication.
+  console.error(
+    `[ai-client] OpenAI streamed empty output (${openaiModelFor(params.model)}); retrying with minimal reasoning`
+  );
+  return openaiStreamOnce(params, "minimal", onDelta);
 }
 
 /**
