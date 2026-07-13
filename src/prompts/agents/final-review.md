@@ -123,4 +123,4 @@ CTA OPTION 2:
 CHARACTER COUNT: [X] / 1,400
 ```
 
-Also save to `final/final_script.md`.
+Output ONLY the script in the exact format above. Do not reference any file path, do not mention saving or writing files, and do not add any meta-commentary, disclaimers, or notes about your environment. The script block is the entire response.
